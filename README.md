@@ -1,4 +1,4 @@
-﻿# OSCAR Auth Code Manager - Vercel Edition
+# OSCAR Auth Code Manager - Vercel Edition
 
 Cloudflare Workers KV 风格授权码管理系统，部署在 Vercel，使用 `@vercel/kv` 存储。
 
