@@ -6,81 +6,69 @@ const CORS = {
     'Access-Control-Allow-Headers': 'Content-Type, X-Master-Key',
 };
 
-const MASTER_KEY = process.env.MASTER_KEY || 'admin123';
 const TOKEN = 'ko30re.916919.xyz';
 const MK_KEY = 'config:master_key';
 const CI_KEY = 'config:check_interval';
 
-async function getMasterKey() {
-    const saved = await kv.get(MK_KEY);
-    return saved || MASTER_KEY;
-}
+async function getMK() { return (await kv.get(MK_KEY)) || 'admin123'; }
+async function getCI() { const n = parseInt((await kv.get(CI_KEY)) || '10'); return n > 0 ? n : 10; }
 
-async function getCheckInterval() {
-    const v = await kv.get(CI_KEY);
-    const n = parseInt(v || '10');
-    return n > 0 ? n : 10;
-}
+// === Vercel Serverless Function ===
+export default async function handler(req, res) {
+    const method = req.method;
+    const query = req.query || {};
+    const action = query.action || '';
+    const token = query.token || '';
 
-// === Request helpers ===
-function json(data, status = 200) {
-    return new Response(JSON.stringify(data, null, 2), {
-        status,
-        headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS },
-    });
-}
-
-function html(htmlStr, status = 200) {
-    return new Response(htmlStr, {
-        status,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-    });
-}
-
-// === Main handler ===
-export default async function handler(request) {
-    if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: CORS });
+    // CORS
+    if (method === 'OPTIONS') {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Master-Key');
+        return res.status(204).end();
     }
 
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const action = url.searchParams.get('action');
-    const token = url.searchParams.get('token');
-
-    // Token protection (non-API routes need token)
+    // Token protection for non-API routes
     if (!action && token !== TOKEN) {
-        return Response.redirect('https://www.pku.edu.cn', 302);
+        res.writeHead(302, { Location: 'https://www.pku.edu.cn' });
+        return res.end();
+    }
+
+    // No action = show admin page (unless it's an API call path)
+    if (!action) {
+        return renderAdmin(res);
     }
 
     try {
         // === PUBLIC ENDPOINTS ===
         if (action === 'health') {
-            return json({ status: 'ok', time: Date.now() });
+            return res.status(200).json({ status: 'ok', time: Date.now() });
         }
 
         if (action === 'validate') {
-            if (request.method !== 'POST') return json({ valid: false, message: 'Use POST' }, 405);
-            const body = await request.json();
-            const code = body?.code?.trim();
-            if (!code) return json({ valid: false, message: 'Code required' });
+            if (method !== 'POST') return res.status(405).json({ valid: false, message: 'Use POST' });
+            const body = req.body || {};
+            const code = (body.code || '').trim();
+            if (!code) return res.status(200).json({ valid: false, message: 'Code required' });
 
-            const key = 'code:' + code;
-            const record = await kv.get(key);
-            if (!record) return json({ valid: false, message: 'Not found' });
+            const record = await kv.get('code:' + code);
+            if (!record) return res.status(200).json({ valid: false, message: 'Not found' });
             const data = JSON.parse(record);
-            if (!data.active) return json({ valid: false, message: 'Disabled' });
-            if (Date.now() > new Date(data.expiresAt).getTime()) {
-                return json({ valid: false, message: 'Expired', expiresAt: data.expiresAt });
+            if (!data.active) return res.status(200).json({ valid: false, message: 'Disabled' });
+
+            const now = Date.now();
+            const expTime = new Date(data.expiresAt).getTime();
+            if (now > expTime) {
+                return res.status(200).json({ valid: false, message: 'Expired', expiresAt: data.expiresAt });
             }
 
             data.useCount = (data.useCount || 0) + 1;
             data.lastLoginAt = new Date().toISOString();
             data.isOnline = true;
-            await kv.set(key, JSON.stringify(data));
+            await kv.set('code:' + code, JSON.stringify(data));
 
-            const interval = await getCheckInterval();
-            return json({
+            const interval = await getCI();
+            return res.status(200).json({
                 valid: true, message: 'Valid',
                 expiresAt: data.expiresAt, note: data.note || '',
                 checkInterval: interval,
@@ -89,27 +77,25 @@ export default async function handler(request) {
         }
 
         if (action === 'logout') {
-            if (request.method !== 'POST') return json({ success: false, message: 'Use POST' }, 405);
-            const body = await request.json();
-            const code = body?.code?.trim();
-            if (!code) return json({ success: false, message: 'Code required' });
+            if (method !== 'POST') return res.status(405).json({ success: false, message: 'Use POST' });
+            const body = req.body || {};
+            const code = (body.code || '').trim();
+            if (!code) return res.status(200).json({ success: false, message: 'Code required' });
 
-            const key = 'code:' + code;
-            const record = await kv.get(key);
-            if (!record) return json({ success: false, message: 'Not found' });
+            const record = await kv.get('code:' + code);
+            if (!record) return res.status(200).json({ success: false, message: 'Not found' });
             const data = JSON.parse(record);
             data.lastLogoutAt = new Date().toISOString();
             data.isOnline = false;
-            await kv.set(key, JSON.stringify(data));
-            return json({ success: true, message: 'Logged out' });
+            await kv.set('code:' + code, JSON.stringify(data));
+            return res.status(200).json({ success: true, message: 'Logged out' });
         }
 
         // === PROTECTED ENDPOINTS ===
-        const headers = Object.fromEntries(request.headers);
-        const inputKey = headers['x-master-key'] || '';
-        const mk = await getMasterKey();
+        const inputKey = req.headers['x-master-key'] || '';
+        const mk = await getMK();
         if (inputKey !== mk) {
-            return json({ success: false, message: 'Invalid MasterKey' }, 403);
+            return res.status(403).json({ success: false, message: 'Invalid MasterKey' });
         }
 
         switch (action) {
@@ -121,65 +107,58 @@ export default async function handler(request) {
                     if (v) codes.push(JSON.parse(v));
                 }
                 codes.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-                return json({ success: true, codes });
+                return res.status(200).json({ success: true, codes });
             }
 
             case 'create': {
-                const body = await request.json();
-                const code = body?.code?.trim();
-                const expiresAt = body?.expiresAt?.trim();
-                const note = body?.note?.trim() || '';
-                if (!code || !expiresAt) return json({ success: false, message: 'Missing code or expiresAt' });
+                const body = req.body || {};
+                const code = (body.code || '').trim();
+                const expiresAt = (body.expiresAt || '').trim();
+                const note = (body.note || '').trim();
+                if (!code || !expiresAt) return res.status(200).json({ success: false, message: 'Missing code or expiresAt' });
 
-                const key = 'code:' + code;
-                const existing = await kv.get(key);
+                const existing = await kv.get('code:' + code);
                 if (existing) {
                     const data = JSON.parse(existing);
-                    data.expiresAt = expiresAt;
-                    data.note = note;
+                    data.expiresAt = expiresAt; data.note = note;
                     data.updatedAt = new Date().toISOString();
-                    await kv.set(key, JSON.stringify(data));
-                    return json({ success: true, message: 'Updated: ' + code });
+                    await kv.set('code:' + code, JSON.stringify(data));
+                    return res.status(200).json({ success: true, message: 'Updated: ' + code });
                 } else {
-                    const data = {
-                        code, expiresAt, note,
-                        active: true, useCount: 0,
+                    const data = { code, expiresAt, note, active: true, useCount: 0,
                         lastLoginAt: null, lastLogoutAt: null, isOnline: false,
-                        createdAt: new Date().toISOString(), updatedAt: null,
-                    };
-                    await kv.set(key, JSON.stringify(data));
-                    return json({ success: true, message: 'Created: ' + code });
+                        createdAt: new Date().toISOString(), updatedAt: null };
+                    await kv.set('code:' + code, JSON.stringify(data));
+                    return res.status(200).json({ success: true, message: 'Created: ' + code });
                 }
             }
 
             case 'delete': {
-                const body = await request.json();
-                const code = body?.code?.trim();
-                if (!code) return json({ success: false, message: 'Code required' });
+                const body = req.body || {};
+                const code = (body.code || '').trim();
+                if (!code) return res.status(200).json({ success: false, message: 'Code required' });
                 await kv.del('code:' + code);
-                return json({ success: true, message: 'Deleted: ' + code });
+                return res.status(200).json({ success: true, message: 'Deleted: ' + code });
             }
 
-            case 'getConfig': {
-                const interval = await getCheckInterval();
-                return json({ success: true, checkInterval: interval });
-            }
+            case 'getConfig':
+                return res.status(200).json({ success: true, checkInterval: await getCI() });
 
             case 'setConfig': {
-                const body = await request.json();
-                const checkInterval = parseInt(body?.checkInterval || '0');
-                if (checkInterval < 1) return json({ success: false, message: 'Min 1 minute' });
-                await kv.set(CI_KEY, String(checkInterval));
-                return json({ success: true, message: 'Set to ' + checkInterval + ' min' });
+                const body = req.body || {};
+                const interval = parseInt(body.checkInterval || '0');
+                if (interval < 1) return res.status(200).json({ success: false, message: 'Min 1 minute' });
+                await kv.set(CI_KEY, String(interval));
+                return res.status(200).json({ success: true, message: 'Set to ' + interval + ' min' });
             }
 
             case 'batch': {
-                const body = await request.json();
-                const count = parseInt(body?.count || '1');
-                if (count < 1 || count > 500) return json({ success: false, message: 'Range 1-500' });
-                const expiresAt = body?.expiresAt?.trim();
-                if (!expiresAt) return json({ success: false, message: 'Expiry required' });
-                const note = body?.note?.trim() || '';
+                const body = req.body || {};
+                const count = parseInt(body.count || '1');
+                if (count < 1 || count > 500) return res.status(200).json({ success: false, message: 'Range 1-500' });
+                const expiresAt = (body.expiresAt || '').trim();
+                if (!expiresAt) return res.status(200).json({ success: false, message: 'Expiry required' });
+                const note = (body.note || '').trim();
                 const chars = '0123456789abcdefABCDEF';
                 const created = [];
 
@@ -187,34 +166,33 @@ export default async function handler(request) {
                     let code = null;
                     for (let t = 0; t < 100; t++) {
                         let cand = 'OSCAR-';
-                        for (let j = 0; j < 20; j++) {
-                            cand += chars[Math.floor(Math.random() * chars.length)];
-                        }
-                        const existing = await kv.get('code:' + cand);
-                        if (!existing) { code = cand; break; }
+                        for (let j = 0; j < 20; j++) cand += chars[Math.floor(Math.random() * chars.length)];
+                        if (!(await kv.get('code:' + cand))) { code = cand; break; }
                     }
                     if (!code) continue;
-                    const data = {
-                        code, expiresAt, note,
-                        active: true, useCount: 0,
+                    const data = { code, expiresAt, note, active: true, useCount: 0,
                         lastLoginAt: null, lastLogoutAt: null, isOnline: false,
-                        createdAt: new Date().toISOString(), updatedAt: null,
-                    };
+                        createdAt: new Date().toISOString(), updatedAt: null };
                     await kv.set('code:' + code, JSON.stringify(data));
                     created.push(code);
                 }
-                return json({ success: true, message: 'Created ' + created.length + ' codes' });
+                return res.status(200).json({ success: true, message: 'Created ' + created.length + ' codes' });
             }
 
             default:
-                return html(ADMIN_HTML);
+                return renderAdmin(res);
         }
     } catch (err) {
-        return json({ error: err.message }, 500);
+        return res.status(500).json({ error: err.message });
     }
 }
 
-// === ADMIN HTML (same as CF Workers version) ===
+// === Admin page renderer ===
+function renderAdmin(res) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(ADMIN_HTML);
+}
+
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -285,36 +263,34 @@ td{color:#cbd5e1}
 <div class="ft">Validate: POST /api?action=validate | Logout: POST /api?action=logout</div>
 </div>
 <script>
-'use strict';
 var C=[],FC=[],MK="",FIL="all",SCH="",PS=10,CP=1,TP=1,IT,API="";
 (function(a){API=a})(window.location.origin);
-
 function $(i){return document.getElementById(i)}
 function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
 function msg(t,y){var e=$("msg");if(!e)return;e.textContent=t;e.className="msg "+y;setTimeout(function(){e.style.display="none"},4000)}
 function cmsg(t,y){var e=$("cfgMsg");if(!e)return;e.textContent=t;e.className="msg "+y;setTimeout(function(){e.style.display="none"},4000)}
 function gr(){var c="0123456789abcdefABCDEF",s="";for(var i=0;i<20;i++)s+=c[Math.floor(Math.random()*c.length)];return "OSCAR-"+s}
-function gMK(){var s=localStorage.getItem("OSCAR_MK");return s||""}
+function gMK(){return localStorage.getItem("OSCAR_MK")||""}
 function ld(){
- MK=gMK();if(!MK){$("cl").innerHTML='<p class="ep">Login with MasterKey first</p>';return}
+ MK=gMK();if(!MK){$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Login]</p>';return}
  $("cl").innerHTML='<p class="ep">Loading...</p>';
- fetch(API+"/api?action=list",{headers:{"X-Master-Key":MK}}).then(function(r){return r.json()}).then(function(d){if(!d.success){msg("Load fail: "+(d.message||"?"),"e");return}C=d.codes||[];af()}).catch(function(e){msg("Err: "+e.message,"e")})
+ fetch(API+"/api?action=list",{headers:{"X-Master-Key":MK}}).then(function(r){return r.json()}).then(function(d){if(!d.success){msg("Load: "+(d.message||"?"),"e");return}C=d.codes||[];af()}).catch(function(e){msg("Err: "+e.message,"e")})
 }
 function lc(){var d=new Date();d.setFullYear(d.getFullYear()+1);var el=$("ne");if(el&&!el.value)el.value=d.toISOString().slice(0,10);MK=gMK();if(!MK)return;fetch(API+"/api?action=getConfig",{headers:{"X-Master-Key":MK}}).then(function(r){return r.json()}).then(function(d){if(d.success)$("ci").value=d.checkInterval||10}).catch(function(){})}
 function af(){var n=Date.now(),cs=C.slice();if(FIL==="valid")cs=cs.filter(function(x){return x.active&&new Date(x.expiresAt).getTime()>n});else if(FIL==="expired")cs=cs.filter(function(x){return !x.active||new Date(x.expiresAt).getTime()<=n});if(SCH){var q=SCH.toLowerCase();cs=cs.filter(function(x){return x.code.toLowerCase().indexOf(q)>=0||(x.note&&x.note.toLowerCase().indexOf(q)>=0)})}FC=cs;TP=Math.max(1,Math.ceil(FC.length/PS));CP=Math.min(CP,TP);if(CP<1)CP=1;rc();rp()}
 function rc(){var n=Date.now(),a=C.length,v=0,x=0,d=0,o=0,i,c;for(i=0;i<C.length;i++){c=C[i];var et=new Date(c.expiresAt).getTime();if(!c.active||et<=n){d++}else{v++;if(et-n<604800000)x++}if(c.lastLoginAt&&(n-new Date(c.lastLoginAt).getTime())<180000)o++}$("sa").textContent=a;$("sb").textContent=v;$("sc").textContent=x;$("sd").textContent=d;$("se").textContent=o;var db=$("delBtn");if(db)db.style.display=d>0?"inline-block":"none";var st=(CP-1)*PS,en=Math.min(st+PS,FC.length),pd=FC.slice(st,en),html;if(!FC.length)html='<p class="ep">No codes</p>';else{html="<table><tr><th>Code</th><th>Expires</th><th>Status</th><th>Note</th><th>Uses</th><th>Last Login</th><th>Online</th><th>Action</th></tr>";pd.sort(function(a,b){return new Date(b.createdAt)-new Date(a.createdAt)});for(i=0;i<pd.length;i++){c=pd[i];var ex=n>new Date(c.expiresAt).getTime();var sc=ex?"ex":(c.active?"ok":"di");var stx=ex?"Expired":(c.active?"Valid":"Disabled");var ds=ex?"color:#f87171":(n+604800000>new Date(c.expiresAt).getTime()?"color:#fb923c":"");var ol=c.lastLoginAt&&(Date.now()-new Date(c.lastLoginAt).getTime())<180000;html+='<tr><td style="font-family:monospace;font-size:11px">'+esc(c.code)+'</td><td'+(ds?' style="'+ds+'"':"")+">"+esc((c.expiresAt||"").slice(0,10))+'</td><td class="'+sc+'">'+stx+'</td><td>'+esc(c.note||"-")+'</td><td>'+(c.useCount||0)+'</td><td>'+(c.lastLoginAt?new Date(c.lastLoginAt).toLocaleString():"-")+'</td><td class="'+(ol?"on":"of")+'">'+(ol?"Online":"Offline")+'</td><td><span onclick="doDel(this)" data-code="'+esc(c.code)+'" style="color:#ef4444;cursor:pointer;font-size:11px;text-decoration:underline">Del</span><span style="color:#64748b;margin:0 3px">|</span><span onclick="doEdit(this)" data-code="'+esc(c.code)+'" style="color:#fbbf24;cursor:pointer;font-size:11px;text-decoration:underline">Edit</span></td></tr>'}html+="</table>"}$("cl").innerHTML=html}
 function rp(){var pg=$("pg");if(FC.length<=PS){pg.style.display="none";return}pg.style.display="flex";$("bf").disabled=CP<=1;$("bp").disabled=CP<=1;$("bn").disabled=CP>=TP;$("bl").disabled=CP>=TP;$("pi").textContent="P"+CP+"/"+TP;var html="",sp=Math.max(1,CP-4),eg=Math.min(TP,CP+4);if(sp>1){html+='<button onclick="gp(1)">1</button>';if(sp>2)html+='<span style="color:#64748b">...</span>'}for(var i=sp;i<=eg;i++){var cl=i===CP?"cur":"";html+='<button class="'+cl+'" onclick="gp('+i+')">'+i+"</button>"}if(eg<TP){if(eg<TP-1)html+='<span style="color:#64748b">...</span>';html+='<button onclick="gp('+TP+')">'+TP+"</button>"}$("pn").innerHTML=html}
 function gp(p){if(p<1||p>TP)return;CP=p;rc();rp()}
-function doCreate(){var c=$("nc").value.trim(),e=$("ne").value,n=$("nn").value.trim();MK=gMK();if(!MK){msg("Add MasterKey to localStorage first","e");return}if(!e){msg("Select expiry","e");return}if(!c){var f=false;for(var t=0;t<100;t++){var d=gr();if(!C||C.every(function(x){return x.code!==d})){c=d;f=true;break}}if(!f){msg("Cannot generate","e");return}}else if(C&&C.some(function(x){return x.code===c})){msg("Code exists","e");return}fetch(API+"/api?action=create",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({code:c,expiresAt:e+" 23:59:59",note:n})}).then(function(r){return r.json()}).then(function(d){if(d.success){msg("Created: "+c,"o");$("nc").value="";$("nn").value="";ld();lc()}else{msg("Fail: "+(d.message||"?"),"e")}}).catch(function(e){msg("Err: "+e.message,"e")})}
+function doCreate(){var c=$("nc").value.trim(),e=$("ne").value,n=$("nn").value.trim();MK=gMK();if(!MK){msg("Login first","e");return}if(!e){msg("Select expiry","e");return}if(!c){var f=false;for(var t=0;t<100;t++){var d=gr();if(!C||C.every(function(x){return x.code!==d})){c=d;f=true;break}}if(!f){msg("Cannot generate","e");return}}else if(C&&C.some(function(x){return x.code===c})){msg("Existing","e");return}fetch(API+"/api?action=create",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({code:c,expiresAt:e+" 23:59:59",note:n})}).then(function(r){return r.json()}).then(function(d){if(d.success){msg("Created: "+c,"o");$("nc").value="";$("nn").value="";ld();lc()}else{msg("Fail: "+(d.message||"?"),"e")}}).catch(function(e){msg("Err: "+e.message,"e")})}
 function doDel(el){var c=el.dataset.code;MK=gMK();if(!MK||!confirm("Delete?"))return;fetch(API+"/api?action=delete",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({code:c})}).then(function(r){return r.json()}).then(function(d){if(d.success){msg("Deleted","o");ld()}else{msg("Fail: "+d.message,"e")}}).catch(function(e){msg("Err: "+e.message,"e")})}
 function doEdit(el){var c=el.dataset.code,it=null;if(C)for(var i=0;i<C.length;i++)if(C[i].code===c){it=C[i];break}if(!it)return;var ne=prompt("Expires:",(it.expiresAt||"").slice(0,10));if(!ne)return;var nn=prompt("Note:",it.note||"");MK=gMK();if(!MK)return;fetch(API+"/api?action=create",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({code:c,expiresAt:ne+" 23:59:59",note:nn||""})}).then(function(r){return r.json()}).then(function(d){if(d.success){msg("Updated","o");ld()}else{msg("Fail: "+d.message,"e")}}).catch(function(e){msg("Err: "+e.message,"e")})}
 function doBatch(){var n=prompt("Count (1-500):","10");if(!n)return;n=parseInt(n);if(isNaN(n)||n<1||n>500){msg("Range 1-500","e");return}var e=$("ne").value;if(!e){msg("Select date","e");return}var nt=$("nn").value.trim();MK=gMK();if(!MK)return;fetch(API+"/api?action=batch",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({count:n,expiresAt:e+" 23:59:59",note:nt})}).then(function(r){return r.json()}).then(function(d){if(d.success){msg(d.message,"o");ld()}else{msg("Fail: "+d.message,"e")}}).catch(function(e){msg("Err: "+e.message,"e")})}
 function doPurge(){if(!confirm("Delete ALL expired?"))return;MK=gMK();if(!MK)return;var n=Date.now(),ex=[];if(C)for(var i=0;i<C.length;i++)if(!C[i].active||new Date(C[i].expiresAt).getTime()<=n)ex.push(C[i]);if(!ex.length){msg("None expired","o");return}var dn=0,fl=0,t=ex.length;ex.forEach(function(x){fetch(API+"/api?action=delete",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({code:x.code})}).then(function(r){return r.json()}).then(function(d){if(d.success)dn++;else fl++;if(dn+fl>=t){msg("Purged "+dn+", fail "+fl,"o");ld()}}).catch(function(){fl++;if(dn+fl>=t){msg("Purged "+dn+", fail "+fl,"o");ld()}})})}
 function doSaveCfg(){var v=parseInt($("ci").value);if(!v||v<1){cmsg("Min 1","e");return}MK=gMK();if(!MK)return;fetch(API+"/api?action=setConfig",{method:"POST",headers:{"Content-Type":"application/json","X-Master-Key":MK},body:JSON.stringify({checkInterval:v})}).then(function(r){return r.json()}).then(function(d){if(d.success){cmsg("Saved: "+d.message,"o");lc()}else{cmsg("Fail: "+d.message,"e")}}).catch(function(e){cmsg("Err: "+e.message,"e")})}
 function doLogin(){var k=prompt("Enter MASTER_KEY:");if(!k)return;localStorage.setItem("OSCAR_MK",k);MK=k;ld();lc();msg("Logged in","o")}
-function doLogout(){localStorage.removeItem("OSCAR_MK");MK="";$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Click to enter MasterKey]</p>';msg("Logged out","o")}
+function doLogout(){localStorage.removeItem("OSCAR_MK");MK="";$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Login]</p>';msg("Logged out","o")}
 (function(){var si=$("sch");if(si)si.addEventListener("input",function(){SCH=this.value.trim().toLowerCase();CP=1;af()});var se=$("fil");if(se)se.addEventListener("change",function(){FIL=this.value;CP=1;af()})})();
-(function(){MK=gMK();if(MK){ld();lc()}else{$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Click to enter MasterKey]</p>'}})();
-function rt(){clearTimeout(IT);IT=setTimeout(function(){localStorage.removeItem("OSCAR_MK");MK="";msg("Session expired","e");$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Click to re-enter MasterKey]</p>'},300000)}
+(function(){MK=gMK();if(MK){ld();lc()}else{$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Login]</p>'}})();
+function rt(){clearTimeout(IT);IT=setTimeout(function(){localStorage.removeItem("OSCAR_MK");MK="";msg("Expired","e");$("cl").innerHTML='<p class="ep" style="cursor:pointer" onclick="doLogin()">[Login]</p>'},300000)}
 document.addEventListener("mousemove",rt);document.addEventListener("click",rt);document.addEventListener("keypress",rt);rt();
 </script></body></html>`;
